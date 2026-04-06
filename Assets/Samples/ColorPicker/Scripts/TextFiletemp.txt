@@ -1,0 +1,508 @@
+﻿using Meta.XR;
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Collections;
+using Debug = UnityEngine.Debug;
+
+[RequireComponent(typeof(LineRenderer))]
+public class BlobDetector : MonoBehaviour
+{
+    [Header("XR")]
+    public Transform rayOrigin;
+    public Camera vrCamera;
+    public EnvironmentRaycastManager raycastManager;
+    public PassthroughCameraAccess cameraAccess;
+
+    [Header("Visuals")]
+    public Transform marker;
+    public float laserLength = 5f;
+    public float markerHeightOffset = 0.05f;
+
+    [Header("Blob")]
+    public int searchRadius = 300;
+    private float anchorHue;
+    [Header("Color Validation")]
+    [Range(0.01f, 0.25f)] public float hueTolerance;
+    [Range(0f, 0.1f)] public float hueAdaptRate ;
+    [Range(0.01f, 0.5f)] public float satTolerance ;
+    [Range(0.01f, 0.5f)] public float valTolerance;
+
+    [Header("Size Validation")]
+    [Range(0.1f, 1f)] public float sizeTolerance = 0.4f;
+
+    [Header("Smoothing")]
+    [Range(0.05f, 1f)] public float trackingSmooth = 0.45f;
+    [Range(1f, 30f)] public float smoothFrames = 3f;
+
+    [Header("Search (when lost)")]
+    public int searchStepSize = 8;    // px step during lost scan
+    public int minBlobPixels = 30;   // redetect threshold
+
+    // ── private state ────────────────────────────────────────────
+    private LineRenderer line;
+    private NativeArray<Color32> pixels;
+    private Vector2Int resolution;
+    private bool hasPixels = false;
+
+    private bool isTracking = false;
+    private bool isSearching = false;   // lost — scanning fullscreen
+
+    private Vector2Int trackedCenter;
+    private Vector2Int previousCenter;
+    private Vector2Int blobVelocity;              // pixels/frame (smoothed)
+
+    private List<Vector2Int> pts = new List<Vector2Int>(1000);
+    private Color32 refColor;
+    private float refHue, refSat, refVal;
+    private float trackedHue;
+    private int referenceBlobSize = 0;
+    private int framesLost = 0;
+
+    // world position (updated every tracked frame)
+    private Vector3 lockedWorldPos;
+    private Vector3 lockedNormal;
+
+    // smoothing
+    private Vector3 markerVelocity = Vector3.zero;
+    private Vector3 smoothedMarkerTarget;
+    private bool smoothTargetSet = false;
+
+    // ── export ───────────────────────────────────────────────────
+    public bool HasValidLocation => isTracking && marker != null && marker.gameObject.activeSelf;
+    public Vector3 LastKnownWorldPosition { get; private set; }
+    public Vector3 LastKnownNormal { get; private set; }
+
+    public bool ExportMarkerLocation(out Vector3 worldPosition, out Vector3 surfaceNormal)
+    {
+        if (HasValidLocation) { worldPosition = LastKnownWorldPosition; surfaceNormal = LastKnownNormal; return true; }
+        worldPosition = Vector3.zero; surfaceNormal = Vector3.up; return false;
+    }
+    public bool ExportMarkerLocation(out Vector3 worldPosition) => ExportMarkerLocation(out worldPosition, out _);
+
+    // ─────────────────────────────────────────────────────────────
+    void Start()
+    {
+        line = GetComponent<LineRenderer>();
+        line.positionCount = 2;
+        if (!vrCamera) vrCamera = Camera.main;
+        if (marker) marker.gameObject.SetActive(false);
+    }
+
+    void Update()
+    {
+        // 1. grab pixels
+        if (cameraAccess && cameraAccess.IsPlaying)
+        {
+            pixels = cameraAccess.GetColors();
+            resolution = cameraAccess.CurrentResolution;
+            hasPixels = pixels.IsCreated && pixels.Length > 0;
+        }
+
+        // 2. laser
+        Ray ray = new Ray(rayOrigin.position, rayOrigin.forward);
+        bool hitSurface = raycastManager.Raycast(ray, out var hit);
+        line.SetPosition(0, ray.origin);
+        line.SetPosition(1, hitSurface ? hit.point : ray.origin + ray.direction * laserLength);
+
+        // 3. button — always (re)detect, erasing previous target
+        if (OVRInput.GetDown(OVRInput.Button.Any))
+        {
+            if (hitSurface && hasPixels)
+                Detect(hit.point, hit.normal);
+            else
+                Debug.Log($"[button] Can't detect — hitSurface:{hitSurface} hasPixels:{hasPixels}");
+        }
+
+        // 4. main loop
+        if (!hasPixels) return;
+
+        if (isTracking)
+            TrackBlob();
+        else if (isSearching)
+            SearchFullscreen();
+
+        // 5. export
+        if (marker && marker.gameObject.activeSelf)
+            LastKnownWorldPosition = marker.position - LastKnownNormal * markerHeightOffset;
+    }
+
+    // ── DETECT ───────────────────────────────────────────────────
+    // Called on button press OR internally after search finds 30+ px
+    void Detect(Vector3 worldPoint, Vector3 normal)
+    {
+        Vector3 vp = cameraAccess.WorldToViewportPoint(worldPoint);
+        if (vp.x < 0 || vp.x > 1 || vp.y < 0 || vp.y > 1) { Debug.Log("[Detect] Out of viewport"); return; }
+
+        int cx = Mathf.Clamp((int)(vp.x * resolution.x), 0, resolution.x - 1);
+        int cy = Mathf.Clamp((int)(vp.y * resolution.y), 0, resolution.y - 1);
+
+        DetectAtPixel(cx, cy, normal);
+    }
+
+    // shared by button-detect and search-redetect
+    void DetectAtPixel(int cx, int cy, Vector3 normal)
+    {
+        // instead of reading single pixel, sample average HSV of nearby matching pixels
+        // first pass: get center pixel color to bootstrap
+        Color32 centerCol = pixels[cy * resolution.x + cx];
+        Color.RGBToHSV(centerCol, out float h, out float s, out float v);
+
+        if (s < 0.30f || v < 0.15f) { Debug.Log($"[Detect] Bad color s:{s:F2} v:{v:F2}"); return; }
+
+        // temporarily set loose refs to count the blob
+        refHue = h; refSat = s; refVal = v;
+        trackedHue = h;
+
+        // ✅ sample average HSV from the actual blob pixels, not just center
+        int sampleRadius = 40;
+        float sinSum = 0, cosSum = 0, satSum = 0, valSum = 0;
+        int sampleCount = 0;
+
+        for (int dy = -sampleRadius; dy <= sampleRadius; dy += 3)
+            for (int dx = -sampleRadius; dx <= sampleRadius; dx += 3)
+            {
+                int px = Mathf.Clamp(cx + dx, 0, resolution.x - 1);
+                int py = Mathf.Clamp(cy + dy, 0, resolution.y - 1);
+                Color32 c = pixels[py * resolution.x + px];
+                Color.RGBToHSV(c, out float ph, out float ps, out float pv);
+                if (ps < 0.30f || pv < 0.15f) continue;
+                float diff = Mathf.Abs(ph - h);
+                if (Mathf.Min(diff, 1f - diff) > 0.08f) continue; // loose pass for sampling
+
+                sinSum += Mathf.Sin(ph * Mathf.PI * 2f);
+                cosSum += Mathf.Cos(ph * Mathf.PI * 2f);
+                satSum += ps;
+                valSum += pv;
+                sampleCount++;
+            }
+
+        if (sampleCount > 5)
+        {
+            float angle = Mathf.Atan2(sinSum / sampleCount, cosSum / sampleCount);
+            h = (angle / (Mathf.PI * 2f) + 1f) % 1f;
+            s = satSum / sampleCount;
+            v = valSum / sampleCount;
+        }
+
+        // ✅ now set refs from averaged blob color
+        refHue = h; refSat = s; refVal = v;
+        trackedHue = h;
+        anchorHue = h;   // 🔒 permanent reference
+       
+        refColor = centerCol; // keep for FastColorMatch fallback
+
+        trackedCenter = new Vector2Int(cx, cy);
+        previousCenter = trackedCenter;
+        blobVelocity = Vector2Int.zero;
+        framesLost = 0;
+
+        referenceBlobSize = CountBlobPixels(cx, cy, h);
+        if (referenceBlobSize < minBlobPixels)
+        {
+            Debug.Log($"[Detect] Blob too small:{referenceBlobSize}");
+            return;
+        }
+
+        lockedNormal = normal;
+        LastKnownNormal = normal;
+        smoothTargetSet = false;
+        markerVelocity = Vector3.zero;
+        isTracking = true;
+        isSearching = false;
+        if (marker) marker.gameObject.SetActive(true);
+
+        Debug.Log($"🎯 Detect — hue:{h:F2} sat:{s:F2} val:{v:F2} size:{referenceBlobSize}px samples:{sampleCount}");
+    }
+
+    // ── TRACK ────────────────────────────────────────────────────
+    private int consecutiveLostFrames = 0;
+    private const int LOST_GRACE_FRAMES = 3;
+    void TrackBlob()
+    {
+        // predict next center from velocity
+        Vector2Int predicted = trackedCenter + blobVelocity;
+        predicted.x = Mathf.Clamp(predicted.x, 0, resolution.x - 1);
+        predicted.y = Mathf.Clamp(predicted.y, 0, resolution.y - 1);
+
+        pts.Clear();
+        int r = searchRadius;
+
+        for (int dy = -r; dy <= r; dy += 2)
+            for (int dx = -r; dx <= r; dx += 2)
+            {
+                if (dx * dx + dy * dy > r * r) continue;
+                int px = predicted.x + dx;
+                int py = predicted.y + dy;
+                if (px < 0 || py < 0 || px >= resolution.x || py >= resolution.y) continue;
+                Color32 col = pixels[py * resolution.x + px];
+                Color.RGBToHSV(col, out float h, out float s, out float v);
+                if (s < 0.30f || v < 0.15f) continue;
+                if (ColorMatches(h, s, v)) pts.Add(new Vector2Int(px, py));
+            }
+
+        // lost?
+        if (pts.Count < minBlobPixels)
+        {
+            consecutiveLostFrames++;
+            Debug.Log($"[track] Low pixels:{pts.Count} ({consecutiveLostFrames}/{LOST_GRACE_FRAMES})");
+
+            if (consecutiveLostFrames >= LOST_GRACE_FRAMES)
+            {
+                consecutiveLostFrames = 0;
+                Debug.Log("[track] Lost confirmed → searching");
+                GoSearching();
+            }
+            return;
+        }
+
+            // size sanity (soft — just warn, don't kill tracking)
+            if (referenceBlobSize > 0)
+        {
+            float ratio = (float)pts.Count / referenceBlobSize;
+            if (ratio < (1f - sizeTolerance) || ratio > (1f + sizeTolerance))
+                Debug.Log($"[track] Size drift:{ratio:F2}");
+            // don't return — keep tracking anyway
+        }
+
+        // centroid
+        
+        float sx = 0, sy = 0, totalWeight = 0;
+        foreach (var p in pts)
+        {
+            // pixels closer to predicted center get more weight
+            float dist = Vector2Int.Distance(p, predicted);
+            float weight = 1f / (1f + dist * 0.01f);
+            sx += p.x * weight;
+            sy += p.y * weight;
+            totalWeight += weight;
+        }
+        Vector2Int newCenter = new Vector2Int(
+            Mathf.RoundToInt(sx / totalWeight),
+            Mathf.RoundToInt(sy / totalWeight));
+
+        // update velocity (smoothed)
+        Vector2Int rawVel = newCenter - trackedCenter;
+        blobVelocity = Vector2Int.RoundToInt(Vector2.Lerp(
+            new Vector2(blobVelocity.x, blobVelocity.y),
+            new Vector2(rawVel.x, rawVel.y), 0.35f));
+
+        previousCenter = trackedCenter;
+        trackedCenter = newCenter;
+
+        float newHue = GetCentroidHue(pts);
+
+        float diffToAnchor = Mathf.Abs(newHue - anchorHue);
+        diffToAnchor = Mathf.Min(diffToAnchor, 1f - diffToAnchor);
+
+        if (diffToAnchor < hueTolerance * 1.5f)
+        {
+            float adapt = Mathf.Clamp01(1f - diffToAnchor / (hueTolerance * 1.5f));
+            trackedHue = Mathf.Lerp(trackedHue, newHue, hueAdaptRate * adapt);
+        }
+        referenceBlobSize = Mathf.RoundToInt(Mathf.Lerp(referenceBlobSize, pts.Count, 0.05f));
+
+        UpdateWorldPosition(trackedCenter);
+    }
+
+    // ── SEARCH (lost) ────────────────────────────────────────────
+    private int searchOffsetY = 0;  // which row we're up to this frame
+    private int searchFrameBudgetMs = 4; // max ms per frame for search
+
+    void SearchFullscreen()
+    {
+        // optional: run every 2 frames for extra performance
+        if (Time.frameCount % 2 != 0) return;
+
+        framesLost++;
+
+        int width = resolution.x;
+        int height = resolution.y;
+
+        Vector2Int predicted = trackedCenter + blobVelocity * Mathf.Min(framesLost, 10);
+        predicted.x = Mathf.Clamp(predicted.x, 0, width - 1);
+        predicted.y = Mathf.Clamp(predicted.y, 0, height - 1);
+
+        int maxR = Mathf.Max(width, height);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // resume radius from last frame
+        int rStart = searchOffsetY;
+
+        for (int r = rStart; r <= maxR; r += searchStepSize)
+        {
+            // ⏱ time budget
+            if (sw.ElapsedMilliseconds >= searchFrameBudgetMs)
+            {
+                searchOffsetY = r;
+                return;
+            }
+
+            // scan circle around predicted point
+            for (int angle = 0; angle < 360; angle += 15)
+            {
+                float rad = angle * Mathf.Deg2Rad;
+
+                int sx = predicted.x + (int)(Mathf.Cos(rad) * r);
+                int sy = predicted.y + (int)(Mathf.Sin(rad) * r);
+
+                if (sx < 0 || sy < 0 || sx >= width || sy >= height)
+                    continue;
+
+                Color32 col = pixels[sy * width + sx];
+
+                // 🚀 FAST COLOR MATCH (no HSV!)
+                if (!FastColorMatch(col))
+                    continue;
+
+                Vector2Int refined = RefineBlobCenter(new Vector2Int(sx, sy));
+                if (refined == Vector2Int.zero)
+                    continue;
+
+                // found!
+                searchOffsetY = 0;
+
+                Debug.Log($"🔍 Found at {refined} — redetecting");
+
+                DetectAtPixel(refined.x, refined.y, LastKnownNormal);
+                return;
+            }
+        }
+
+        // full scan done
+        searchOffsetY = 0;
+
+        if (Time.frameCount % 60 == 0)
+            Debug.Log($"[search] Full scan done, nothing found. frame:{framesLost}");
+    }
+
+    // ── HELPERS ──────────────────────────────────────────────────
+    void GoSearching()
+    {
+        isTracking = false;
+        isSearching = true;
+        framesLost = 0;
+        searchOffsetY = 0;
+        consecutiveLostFrames = 0;
+    }
+
+    bool FastColorMatch(Color32 c)
+    {
+        int dr = c.r - refColor.r;
+        int dg = c.g - refColor.g;
+        int db = c.b - refColor.b;
+
+        int dist = dr * dr + dg * dg + db * db;
+
+        return dist < 2500; // tweak this if needed
+    }
+    bool ColorMatches(float h, float s, float v)
+    {
+        float diffTracked = Mathf.Abs(h - trackedHue);
+        diffTracked = Mathf.Min(diffTracked, 1f - diffTracked);
+
+        float diffAnchor = Mathf.Abs(h - anchorHue);
+        diffAnchor = Mathf.Min(diffAnchor, 1f - diffAnchor);
+
+        if (diffTracked > hueTolerance) return false;
+        if (diffAnchor > hueTolerance * 1.5f) return false;
+
+       
+        if (Mathf.Abs(s - refSat) > satTolerance) return false;
+        if (Mathf.Abs(v - refVal) > valTolerance) return false;
+
+        return true;
+    }
+
+    int CountBlobPixels(int cx, int cy, float hue)
+    {
+        int count = 0;
+        for (int dy = -searchRadius; dy <= searchRadius; dy += 2)
+            for (int dx = -searchRadius; dx <= searchRadius; dx += 2)
+            {
+                if (dx * dx + dy * dy > searchRadius * searchRadius) continue;
+                int px = cx + dx, py = cy + dy;
+                if (px < 0 || py < 0 || px >= resolution.x || py >= resolution.y) continue;
+                Color32 col = pixels[py * resolution.x + px];
+                Color.RGBToHSV(col, out float h, out float s, out float v);
+                if (s < 0.30f || v < 0.15f) continue;
+                float diff = Mathf.Abs(h - hue);
+                if (Mathf.Min(diff, 1f - diff) < hueTolerance) count++;
+            }
+        return count;
+    }
+
+    float GetCentroidHue(List<Vector2Int> pts)
+    {
+        float sinSum = 0, cosSum = 0;
+        foreach (var p in pts)
+        {
+            Color32 c = pixels[p.y * resolution.x + p.x];
+            Color.RGBToHSV(c, out float h, out _, out _);
+            sinSum += Mathf.Sin(h * Mathf.PI * 2f);
+            cosSum += Mathf.Cos(h * Mathf.PI * 2f);
+        }
+        float angle = Mathf.Atan2(sinSum / pts.Count, cosSum / pts.Count);
+        return (angle / (Mathf.PI * 2f) + 1f) % 1f;
+    }
+
+    // refine seed → centroid; returns zero if blob < minBlobPixels
+    Vector2Int RefineBlobCenter(Vector2Int seed)
+    {
+        List<Vector2Int> localPts = new List<Vector2Int>(300);
+        int localRadius = 80;
+
+        for (int dy = -localRadius; dy <= localRadius; dy += 4)
+            for (int dx = -localRadius; dx <= localRadius; dx += 4)
+            {
+                int px = seed.x + dx, py = seed.y + dy;
+                if (px < 0 || py < 0 || px >= resolution.x || py >= resolution.y) continue;
+                Color32 c = pixels[py * resolution.x + px];
+                Color.RGBToHSV(c, out float h, out float s, out float v);
+                if (s < 0.30f || v < 0.15f) continue;
+                if (ColorMatches(h, s, v)) localPts.Add(new Vector2Int(px, py));
+            }
+
+        if (localPts.Count < minBlobPixels) return Vector2Int.zero;
+
+        float sx = 0, sy = 0;
+        foreach (var p in localPts) { sx += p.x; sy += p.y; }
+        return new Vector2Int(
+            Mathf.RoundToInt(sx / localPts.Count),
+            Mathf.RoundToInt(sy / localPts.Count));
+    }
+
+    void UpdateWorldPosition(Vector2Int pixel)
+    {
+        float nx = (float)pixel.x / resolution.x;
+        float ny = (float)pixel.y / resolution.y;
+
+        Ray ray;
+        try { ray = cameraAccess.ViewportPointToRay(new Vector3(nx, ny, 0)); }
+        catch { ray = vrCamera.ViewportPointToRay(new Vector3(nx, ny, 0)); }
+
+        if (!raycastManager.Raycast(ray, out var hit)) return;
+
+        lockedWorldPos = hit.point;
+        lockedNormal = hit.normal;
+        LastKnownNormal = hit.normal;
+
+        ApplySmoothMarker(hit.point + hit.normal * markerHeightOffset);
+    }
+
+    void ApplySmoothMarker(Vector3 target)
+    {
+        if (!smoothTargetSet)
+        {
+            smoothedMarkerTarget = target;
+            if (marker) marker.position = target;
+            smoothTargetSet = true;
+            return;
+        }
+        smoothedMarkerTarget = Vector3.Lerp(smoothedMarkerTarget, target, trackingSmooth);
+        float smoothTime = smoothFrames * Time.deltaTime;
+        if (marker)
+            marker.position = Vector3.SmoothDamp(
+                marker.position, smoothedMarkerTarget, ref markerVelocity, smoothTime);
+    }
+}
